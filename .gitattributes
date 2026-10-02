@@ -1,0 +1,6 @@
+# 仓库内一律 LF：采集脚本带 UTF-8 BOM、测试按正则读源码，
+# 换机器 checkout 出 CRLF 只会白白制造 diff 与行尾告警。
+* text=auto eol=lf
+*.cs text eol=lf
+*.ps1 text eol=lf
+*.mjs text eol=lf

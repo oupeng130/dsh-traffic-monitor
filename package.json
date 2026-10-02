@@ -1,0 +1,51 @@
+{
+  "name": "dsh-traffic-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "在 DeepSeek Harness 里看这台机器上每个应用消耗了多少流量：按 TCP 连接的收发字节统计（IP Helper EStats），整机与每块网卡的实时速率与累计，普通权限可用、UAC 提权后精确到应用。",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "scripts": {
+    "test": "node tests/manifest-test.mjs && node tests/host-test.mjs && node tests/client-test.mjs && node tests/live-test.mjs",
+    "test:manifest": "node tests/manifest-test.mjs",
+    "test:host": "node tests/host-test.mjs",
+    "test:client": "node tests/client-test.mjs",
+    "test:live": "node tests/live-test.mjs"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "collector.ps1",
+    "native.cs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "README.md"
+  ],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "traffic",
+    "network-usage",
+    "bandwidth"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "license": "MIT"
+}

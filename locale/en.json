@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Traffic monitor",
+    "description": "See how much traffic each application on this machine uses: adapter rates and totals, connections per app, and per-app byte counts once you approve a UAC prompt. Everything stays on this machine."
+  }
+}
