@@ -44,6 +44,25 @@ const HISTORY_VERSION = 1
 const MINUTE = 60_000
 /** 分钟桶保留 24 小时：1440 条，落盘不到 100 KB。 */
 const KEEP_MINUTES = 24 * 60
+/** 按天封存的历史保留 30 条：每天一条 {day, rx, tx, in, out, apps}，不到 20 KB。 */
+const KEEP_DAYS = 30
+
+/**
+ * 本地日期键（`2026-10-03`）。按**本地日历**划天，不是按 86400 秒切片：
+ * 夏令时那天只有 23 小时，按秒切会在「今天」的窗口里混进昨天的最后 1 小时。
+ */
+function dayKeyOf(ms) {
+  const d = new Date(ms)
+  const p = value => String(value).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** 当地零点的时间戳——「今日自 … 起」显示的就是它。 */
+function startOfLocalDay(ms) {
+  const d = new Date(ms)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
 /** 快照超过这个时间没更新就判定采集器掉线。 */
 const STALE_MS = 10_000
 const MODES = new Set(['normal', 'elevated', 'off'])
@@ -174,13 +193,18 @@ export function apply(ctx, config) {
   settings.intervalMs = clamp(Number(settings.intervalMs) || 2000, 500, 60_000)
   settings.top = clamp(Math.trunc(Number(settings.top) || 20), 5, 200)
 
-  const history = loadJson(historyFile, { version: HISTORY_VERSION, minutes: [], apps: {} })
+  const history = loadJson(historyFile, { version: HISTORY_VERSION, minutes: [], apps: {}, days: [], day: '', dayTotals: null })
   if (!Array.isArray(history.minutes)) history.minutes = []
   if (typeof history.apps !== 'object' || history.apps === null) history.apps = {}
+  if (!Array.isArray(history.days)) history.days = []
 
   /** 运行时状态——全部内存态，落盘的只有 settings 与 history。 */
   const state = {
     startedAt: Date.now(),
+    /** 当前统计窗口的日期键；跨零点由 rollDayIfNeeded 换成新的一天。 */
+    day: '',
+    /** 窗口起点（今日零点），只用于展示「自 … 起」。 */
+    since: startOfLocalDay(Date.now()),
     status: 'stopped',          // stopped | running | stale | error
     error: '',
     mode: 'off',
@@ -231,6 +255,10 @@ export function apply(ctx, config) {
 
     const dtSec = prevTs > 0 ? clamp((ts - prevTs) / 1000, 0.05, 120) : 0
     const now = Date.now()
+
+    // 跨天先归零，再算这一轮的增量：新一天从 0 开始，
+    // 而跨零点还开着的连接沿用上一轮累计值当基线，增量照常落在新的一天。
+    rollDayIfNeeded(now)
 
     // 网卡：累计计数器的差就是这段时间真实过卡的字节
     let dRx = 0
@@ -339,11 +367,19 @@ export function apply(ctx, config) {
     state.minute.tx += dTx
     state.minute.in += dIn
     state.minute.out += dOut
-    if (minuteKey !== state.minute.t) {
-      history.minutes.push({ t: state.minute.t * MINUTE, rx: state.minute.rx, tx: state.minute.tx, in: state.minute.in, out: state.minute.out })
-      state.minute = { t: minuteKey, rx: 0, tx: 0, in: 0, out: 0 }
-      pruneMinutes()
-    }
+    if (minuteKey !== state.minute.t) flushMinute()
+  }
+
+  /** 当前分钟桶落盘并换新桶。`t=0` 表示「还没开始」，下一轮 ingest 会重新开桶。 */
+  function flushMinute() {
+    if (state.minute.t === 0) return
+    history.minutes.push({
+      t: state.minute.t * MINUTE,
+      rx: state.minute.rx, tx: state.minute.tx,
+      in: state.minute.in, out: state.minute.out,
+    })
+    state.minute = { t: 0, rx: 0, tx: 0, in: 0, out: 0 }
+    pruneMinutes()
   }
 
   function pruneMinutes() {
@@ -351,35 +387,144 @@ export function apply(ctx, config) {
     history.minutes = history.minutes.slice(-KEEP_MINUTES)
   }
 
-  /** 会话累计（按应用名合并）也落盘，重启不清零；7 天没露面的应用条目丢掉。 */
+  /** 当前有账的应用，按总量倒序，截前 N 个——封存一天时只留得下前十名。 */
+  function topAppsOf(limit) {
+    return [...state.apps.values()]
+      .filter(row => row.totalIn > 0 || row.totalOut > 0)
+      .sort((a, b) => (b.totalIn + b.totalOut) - (a.totalIn + a.totalOut))
+      .slice(0, limit)
+      .map(row => ({ name: row.name, in: Math.round(row.totalIn), out: Math.round(row.totalOut) }))
+  }
+
+  const sumOf = (apps, field) => Object.values(apps ?? {}).reduce((total, value) => total + num(value?.[field]), 0)
+
+  /** 把某一天的账写进按天归档（同一 day 覆盖，最多留 KEEP_DAYS 条）。 */
+  function archiveDay(day, totals, apps) {
+    if (typeof day !== 'string' || day === '') return
+    const rest = (history.days ?? []).filter(row => row?.day !== day)
+    rest.push({
+      day,
+      rx: Math.round(num(totals?.rx)),
+      tx: Math.round(num(totals?.tx)),
+      in: Math.round(num(totals?.in)),
+      out: Math.round(num(totals?.out)),
+      apps,
+    })
+    rest.sort((a, b) => String(a?.day ?? '').localeCompare(String(b?.day ?? '')))
+    history.days = rest.slice(-KEEP_DAYS)
+  }
+
+  /**
+   * 跨零点归零：统计量是「今日」的，不是「自开机以来」的。
+   *
+   * 归零前先把昨天封存进 `history.days`，所以重置只是换个计数窗口，数据不销毁。
+   * 连接与应用条目都保留——跨零点还开着的连接，上一轮的累计值仍是有效基线，
+   * 归零后第一笔增量照常落在新的一天里：既不重算，也不漏。
+   *
+   * 当前分钟桶可能横跨两天，先按原时间戳落盘再开新桶，曲线不会缺一段，
+   * 也不会把昨天最后一分钟算到今天头上。
+   */
+  function rollDayIfNeeded(now) {
+    const today = dayKeyOf(now)
+    if (state.day === '') {
+      state.day = today
+      state.since = startOfLocalDay(now)
+      return
+    }
+    if (state.day === today) return
+
+    flushMinute()
+    archiveDay(state.day, state.totals, topAppsOf(10))
+    state.totals = { rx: 0, tx: 0, in: 0, out: 0 }
+    for (const row of state.apps.values()) { row.totalIn = 0; row.totalOut = 0 }
+    state.day = today
+    state.since = startOfLocalDay(now)
+
+    // 立刻落盘：刚归零就断电的话，重启不能把昨天的数又当成今天的读回来。
+    history.day = today
+    history.dayTotals = null
+    try { persistHistory() } catch (error) {
+      logger.warn?.(`traffic-monitor: 跨天归零后写盘失败（${error?.message ?? error}）`)
+    }
+  }
+
+  /**
+   * 落盘「今天」这个窗口：日期键、今日总量、今日各应用、分钟曲线、按天归档。
+   *
+   * 应用条目一旦跨天就是昨天的账，把它合进今天的窗口会把刚清零的数又填回去，
+   * 所以这里只写当前内存态，不做任何跨天合并——跨天的那部分由 archiveDay 负责。
+   */
   function persistHistory() {
-    const cutoff = Date.now() - 7 * 24 * 3600_000
     const apps = {}
     for (const row of state.apps.values()) {
       if (row.totalIn === 0 && row.totalOut === 0) continue
       apps[row.name] = { in: Math.round(row.totalIn), out: Math.round(row.totalOut), last: row.last }
     }
-    for (const [key, value] of Object.entries(history.apps ?? {})) {
-      if (apps[key] !== undefined) continue
-      if (Number(value?.last ?? 0) >= cutoff) apps[key] = value
-    }
     history.apps = apps
+    history.day = state.day
+    history.dayTotals = {
+      rx: Math.round(state.totals.rx), tx: Math.round(state.totals.tx),
+      in: Math.round(state.totals.in), out: Math.round(state.totals.out),
+    }
     history.version = HISTORY_VERSION
     try { atomicWrite(historyFile, JSON.stringify(history)) } catch (error) {
       logger.warn?.(`traffic-monitor: 写历史失败（${error?.message ?? error}）`)
     }
   }
 
-  function restoreApps() {
-    // 重启后先按历史把累计垫回来，第一轮增量会在这个基础上继续加。
-    for (const [key, value] of Object.entries(history.apps ?? {})) {
-      const row = appState(key)
-      row.totalIn = num(value?.in)
-      row.totalOut = num(value?.out)
-      row.last = num(value?.last)
+  /**
+   * 启动对账，三种情况：
+   *
+   *   存盘那天就是今天 → 接着算，重启不清零；
+   *   存盘没有日期键   → 升级上来的旧文件，里面是「自开机以来」的累计，
+   *                      按今天接过来，不让用户一升级就把数丢了；
+   *   存盘是更早那天   → 先封存那一天再归零——关机跨了零点，不能让它冒充今天。
+   */
+  function restoreDaily() {
+    const now = Date.now()
+    const today = dayKeyOf(now)
+    const storedDay = typeof history.day === 'string' ? history.day : ''
+
+    if (storedDay !== '' && storedDay !== today) {
+      archiveDay(
+        storedDay,
+        history.dayTotals ?? { rx: 0, tx: 0, in: sumOf(history.apps, 'in'), out: sumOf(history.apps, 'out') },
+        Object.entries(history.apps ?? {})
+          .map(([name, value]) => ({ name, in: num(value?.in), out: num(value?.out) }))
+          .sort((a, b) => (b.in + b.out) - (a.in + a.out))
+          .slice(0, 10),
+      )
+      history.apps = {}
+      history.dayTotals = null
+      state.totals = { rx: 0, tx: 0, in: 0, out: 0 }
+    } else {
+      // 没有 dayTotals 的旧文件只能按应用和推总量：rx/tx 属网卡口径，
+      // 没有历史基线就是 0，不猜。
+      const stored = history.dayTotals
+      state.totals = {
+        rx: num(stored?.rx), tx: num(stored?.tx),
+        in: num(stored?.in) || sumOf(history.apps, 'in'),
+        out: num(stored?.out) || sumOf(history.apps, 'out'),
+      }
+      for (const [key, value] of Object.entries(history.apps ?? {})) {
+        const row = appState(key)
+        row.totalIn = num(value?.in)
+        row.totalOut = num(value?.out)
+        row.last = num(value?.last)
+      }
+    }
+
+    state.day = today
+    state.since = startOfLocalDay(now)
+    history.day = today
+
+    // 启动就对过账，立刻写盘：否则封存的昨天与归零的今天只活在内存里，
+    // 60 秒定时器没到就崩的话，下次启动会拿旧文件再对一次账。
+    try { persistHistory() } catch (error) {
+      logger.warn?.(`traffic-monitor: 启动对账后写盘失败（${error?.message ?? error}）`)
     }
   }
-  restoreApps()
+  restoreDaily()
 
   // ── 采集进程 ──────────────────────────────────────────────────────────────
 
@@ -575,6 +720,8 @@ export function apply(ctx, config) {
       version,
       mode: state.mode,
       enabled: settings.enabled,
+      /** 当前统计窗口的日期键（`2026-10-03`），跨零点自动换新。 */
+      day: state.day,
       elevated: caps.elevated === true,
       estats: String(caps.estats ?? 'off'),
       byteRows: num(caps.byteRows),
@@ -594,7 +741,9 @@ export function apply(ctx, config) {
         out: Math.round(state.totals.out),
         rateRx: Math.round(state.rates.rx),
         rateTx: Math.round(state.rates.tx),
-        since: state.startedAt,
+        since: state.since,
+        day: state.day,
+        uptimeSince: state.startedAt,
       },
       adapters: [...state.adapters.values()]
         .map(row => ({ name: row.name, rx: Math.round(row.rx), tx: Math.round(row.tx), rateRx: Math.round(row.rateRx), rateTx: Math.round(row.rateTx) }))
@@ -611,7 +760,10 @@ export function apply(ctx, config) {
 
   function buildHistory() {
     return {
+      day: state.day,
       minutes: history.minutes.slice(-240),
+      // 按天归档：新的排前面，页面最多摆 7 天
+      days: [...(history.days ?? [])].slice(-7).reverse(),
       apps: Object.entries(history.apps ?? {})
         .map(([name, value]) => ({ name, in: num(value?.in), out: num(value?.out), last: num(value?.last) }))
         .sort((a, b) => (b.in + b.out) - (a.in + a.out))
@@ -741,3 +893,6 @@ function readVersion() {
     return ''
   }
 }
+
+/** 测试缝：日历日键与零点计算是跨天归零的判据，单独拿出来可测。 */
+export const __test = { dayKeyOf, startOfLocalDay, KEEP_DAYS, KEEP_MINUTES }

@@ -20,7 +20,8 @@ const PKG = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-traffic-test-'))
 process.env.DSH_HOME = TMP
 
-const { apply } = await import(pathToFileURL(path.join(PKG, 'index.js')).href)
+const hostModule = await import(pathToFileURL(path.join(PKG, 'index.js')).href)
+const { apply, __test: { dayKeyOf, startOfLocalDay, KEEP_DAYS } } = hostModule
 
 let passed = 0
 function ok(label, condition, detail) {
@@ -196,6 +197,101 @@ for (const dispose of disposers) dispose()
 await sleep(300)
 const historyFile = path.join(TMP, 'traffic-monitor', 'history.json')
 ok('释放时把历史写盘', fs.existsSync(historyFile) && JSON.parse(fs.readFileSync(historyFile, 'utf8')).version === 1, historyFile)
+
+// ── 5. 按天归零 ────────────────────────────────────────────────────────────
+const todayKey = dayKeyOf(Date.now())
+ok('日历日键是本地日期', /^\d{4}-\d{2}-\d{2}$/.test(todayKey) && todayKey === dayKeyOf(Date.now() + 60_000), todayKey)
+ok('零点计算落在当天 00:00', new Date(startOfLocalDay(Date.now())).getHours() === 0 && dayKeyOf(startOfLocalDay(Date.now())) === todayKey,
+  new Date(startOfLocalDay(Date.now())).toString())
+ok('48 小时后的日键不同', dayKeyOf(Date.now()) !== dayKeyOf(Date.now() + 48 * 3600_000))
+ok('按天归档保留 30 天', KEEP_DAYS === 30, String(KEEP_DAYS))
+
+/** 用一个独立的 DSH_HOME 起一份插件，返回路由与释放器。 */
+function bootWith(historyJson, settingsJson) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-traffic-day-'))
+  process.env.DSH_HOME = home
+  fs.mkdirSync(path.join(home, 'traffic-monitor'), { recursive: true })
+  fs.writeFileSync(path.join(home, 'traffic-monitor', 'history.json'), JSON.stringify(historyJson))
+  fs.writeFileSync(path.join(home, 'traffic-monitor', 'settings.json'), JSON.stringify(settingsJson))
+  const routes = []
+  const disposers = []
+  const ctx = {
+    logger: { info: () => {}, warn: () => {} },
+    effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d) },
+    get() { return undefined },
+    inject(deps, cb) {
+      cb({
+        webServer: { register: entry => { routes.push(entry); return () => {} } },
+        effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d) },
+      })
+    },
+  }
+  apply(ctx, {})
+  return { home, routes, disposers }
+}
+
+const silentSettings = { enabled: false, mode: 'normal', intervalMs: 1000, top: 20 }
+
+// (a) 存盘那天就是今天 → 接着算，重启不清零
+{
+  const boot = bootWith({
+    version: 1, minutes: [], days: [], day: todayKey,
+    dayTotals: { rx: 111, tx: 222, in: 333, out: 444 },
+    apps: { 'today-app': { in: 333, out: 444, last: Date.now() } },
+  }, silentSettings)
+  const handler = boot.routes.find(entry => entry.path === '/api/traffic-monitor').handler
+  const summary = JSON.parse((await call(handler, { url: '/api/traffic-monitor/summary' })).body)
+  ok('今天存盘的总量接得上', summary.totals.rx === 111 && summary.totals.in === 333, JSON.stringify(summary.totals))
+  const app = (summary.apps ?? []).find(row => row.name === 'today-app')
+  ok('今天存盘的应用账接得上', app?.totalIn === 333 && app?.totalOut === 444, JSON.stringify(app))
+  ok('窗口起点是今日零点、日期键是今天', summary.day === todayKey && summary.totals.since === startOfLocalDay(Date.now()),
+    `${summary.day} / ${summary.totals.since}`)
+  for (const d of boot.disposers) d()
+  fs.rmSync(boot.home, { recursive: true, force: true })
+}
+
+// (b) 存盘是更早那天 → 先封存再归零（关机跨了零点）
+{
+  const boot = bootWith({
+    version: 1, minutes: [], days: [], day: '2000-01-02',
+    dayTotals: { rx: 1000, tx: 2000, in: 3000, out: 4000 },
+    apps: { 'yesterday-app': { in: 3000, out: 4000, last: 0 } },
+  }, silentSettings)
+  const handler = boot.routes.find(entry => entry.path === '/api/traffic-monitor').handler
+  const summary = JSON.parse((await call(handler, { url: '/api/traffic-monitor/summary' })).body)
+  ok('跨零点启动后总量归零', summary.totals.rx === 0 && summary.totals.in === 0, JSON.stringify(summary.totals))
+  const stale = (summary.apps ?? []).find(row => row.name === 'yesterday-app')
+  ok('昨天的应用账没有混进今天', stale === undefined || stale.totalIn === 0, JSON.stringify(stale))
+
+  const historyNow = JSON.parse((await call(handler, { url: '/api/traffic-monitor/history' })).body)
+  const archived = (historyNow.days ?? []).find(row => row.day === '2000-01-02')
+  ok('昨天的账被封存', archived !== undefined, JSON.stringify(historyNow.days))
+  ok('封存保留了总量与应用明细', archived?.rx === 1000 && archived?.in === 3000 &&
+    (archived?.apps ?? []).some(row => row.name === 'yesterday-app' && row.in === 3000), JSON.stringify(archived))
+  const stored = JSON.parse(fs.readFileSync(path.join(boot.home, 'traffic-monitor', 'history.json'), 'utf8'))
+  ok('归零后立即写盘的日期键是今天', stored.day === todayKey, stored.day)
+
+  for (const d of boot.disposers) d()
+  fs.rmSync(boot.home, { recursive: true, force: true })
+}
+
+// (c) 没有日期键的旧文件 → 按今天接过来，不丢数
+{
+  const boot = bootWith({
+    version: 1, minutes: [], days: [],
+    apps: { 'legacy-app': { in: 500, out: 600, last: Date.now() } },
+  }, silentSettings)
+  const handler = boot.routes.find(entry => entry.path === '/api/traffic-monitor').handler
+  const summary = JSON.parse((await call(handler, { url: '/api/traffic-monitor/summary' })).body)
+  const legacy = (summary.apps ?? []).find(row => row.name === 'legacy-app')
+  ok('旧文件的应用账按今天接过来', legacy?.totalIn === 500 && legacy?.totalOut === 600, JSON.stringify(legacy))
+  const stored = JSON.parse(fs.readFileSync(path.join(boot.home, 'traffic-monitor', 'history.json'), 'utf8'))
+  ok('旧文件没有被误判成跨天归档', Array.isArray(stored.days) && stored.days.length === 0, JSON.stringify(stored.days))
+  for (const d of boot.disposers) d()
+  fs.rmSync(boot.home, { recursive: true, force: true })
+}
+
+process.env.DSH_HOME = TMP
 
 console.log(`\nhost-test: ${passed} passed${process.exitCode ? '，有失败' : ''}`)
 fs.rmSync(TMP, { recursive: true, force: true })

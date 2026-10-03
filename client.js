@@ -53,9 +53,9 @@ window.__ModuleLoader__.load({
 
         'stat.rateDown': '下行速率',
         'stat.rateUp': '上行速率',
-        'stat.totalDown': '会话累计下行',
-        'stat.totalUp': '会话累计上行',
-        'stat.since': '自 {t} 起',
+        'stat.totalDown': '今日下行',
+        'stat.totalUp': '今日上行',
+        'stat.since': '自今日 {t} 起',
 
         'tbl.app': '应用',
         'tbl.conn': '连接',
@@ -63,8 +63,8 @@ window.__ModuleLoader__.load({
         'tbl.udp': 'UDP',
         'tbl.rateDown': '下行速率',
         'tbl.rateUp': '上行速率',
-        'tbl.totalDown': '累计下行',
-        'tbl.totalUp': '累计上行',
+        'tbl.totalDown': '今日下行',
+        'tbl.totalUp': '今日上行',
         'tbl.share': '占比',
         'tbl.empty': '当前没有活跃连接。打开浏览器访问一个网站再回来。',
         'tbl.pids': '{n} 个进程',
@@ -80,6 +80,13 @@ window.__ModuleLoader__.load({
         'chart.hint': '按分钟统计的网卡收发（实线=接收，虚线=发送）。',
         'chart.empty': '还没有分钟数据，跑几分钟就有曲线了。',
 
+        'day.title': '按天归档',
+        'day.hint': '每天 00:00 归零，前一天的账封存在这里，保留 30 天。',
+        'day.date': '日期',
+        'day.down': '下行',
+        'day.up': '上行',
+        'day.empty': '还没有封存的天——第一次跨零点之后就有。',
+
         'settings.title': '设置',
         'settings.interval': '采样间隔',
         'settings.top': '表格显示前',
@@ -92,7 +99,7 @@ window.__ModuleLoader__.load({
         'unit.kibps': 'KB/s',
         'unit.mibps': 'MB/s',
         'note.udp': 'UDP（含 QUIC/HTTP3、DNS）没有可用的字节接口，只计连接数。',
-        'note.tcp': '口径：每应用字节 = 该进程所有 TCP 连接的收发字节之和（EStats，RFC 4898），连接关闭后字节已计入会话累计；网卡口径是真实过卡字节，两者不相等。',
+        'note.tcp': '口径：每应用字节 = 该进程所有 TCP 连接的收发字节之和（EStats，RFC 4898），连接关闭后字节已计入今日累计；网卡口径是真实过卡字节，两者不相等。统计量每天 00:00 归零，前一天封存在「按天归档」。',
 
         'float.title': '流量监控',
         'float.hide': '隐藏小窗',
@@ -106,7 +113,7 @@ window.__ModuleLoader__.load({
         'float.shrink': '缩小',
         'float.grow': '放大',
         'float.resize': '拖右下角可以调宽度',
-        'float.share': '会话累计',
+        'float.share': '今日累计',
       },
       en: {
         nav: 'Traffic monitor',
@@ -138,9 +145,9 @@ window.__ModuleLoader__.load({
 
         'stat.rateDown': 'Down',
         'stat.rateUp': 'Up',
-        'stat.totalDown': 'Session down',
-        'stat.totalUp': 'Session up',
-        'stat.since': 'since {t}',
+        'stat.totalDown': 'Today down',
+        'stat.totalUp': 'Today up',
+        'stat.since': 'since {t} today',
 
         'tbl.app': 'Application',
         'tbl.conn': 'Connections',
@@ -148,8 +155,8 @@ window.__ModuleLoader__.load({
         'tbl.udp': 'UDP',
         'tbl.rateDown': 'Down rate',
         'tbl.rateUp': 'Up rate',
-        'tbl.totalDown': 'Total down',
-        'tbl.totalUp': 'Total up',
+        'tbl.totalDown': 'Today down',
+        'tbl.totalUp': 'Today up',
         'tbl.share': 'Share',
         'tbl.empty': 'No active connections. Open a website and come back.',
         'tbl.pids': '{n} processes',
@@ -165,6 +172,13 @@ window.__ModuleLoader__.load({
         'chart.hint': 'Per-minute adapter traffic (solid = received, dashed = sent).',
         'chart.empty': 'No minute data yet.',
 
+        'day.title': 'Day archive',
+        'day.hint': 'The counter resets at 00:00 every day; the previous day is archived here for 30 days.',
+        'day.date': 'Day',
+        'day.down': 'Down',
+        'day.up': 'Up',
+        'day.empty': 'No archived day yet — the first one appears after midnight.',
+
         'settings.title': 'Settings',
         'settings.interval': 'Sample interval',
         'settings.top': 'Show top',
@@ -177,7 +191,7 @@ window.__ModuleLoader__.load({
         'unit.kibps': 'KB/s',
         'unit.mibps': 'MB/s',
         'note.udp': 'UDP (QUIC/HTTP3, DNS) has no byte-counting interface; only connections are counted.',
-        'note.tcp': 'Basis: per-app bytes = the sum of that process’ TCP connection bytes (EStats, RFC 4898); bytes of closed connections stay in the session total. Adapter totals are real wire bytes, so the two differ.',
+        'note.tcp': 'Basis: per-app bytes = the sum of that process’ TCP connection bytes (EStats, RFC 4898); bytes of closed connections stay in today’s total. Adapter totals are real wire bytes, so the two differ. The counter resets at 00:00 daily and the previous day is archived.',
 
         'float.title': 'Traffic',
         'float.hide': 'Hide window',
@@ -191,7 +205,7 @@ window.__ModuleLoader__.load({
         'float.shrink': 'Shrink',
         'float.grow': 'Enlarge',
         'float.resize': 'Drag the corner to resize',
-        'float.share': 'Session total',
+        'float.share': 'Today',
       },
     }
 
@@ -714,9 +728,11 @@ window.__ModuleLoader__.load({
         const guarded = () => { if (alive) void load() }
         guarded()
         const id = setInterval(guarded, 2000)
+        // 分钟曲线与按天归档变化慢：30 秒刷一次就够，页面开着也能自己跨零点换表
+        const historyId = setInterval(() => { if (alive) void loadHistory() }, 30_000)
         void loadHistory()
         api('/meta').then(data => { if (alive) setMeta(data) }).catch(() => {})
-        return () => { alive = false; clearInterval(id) }
+        return () => { alive = false; clearInterval(id); clearInterval(historyId) }
       }, [load, loadHistory])
 
       const applySettings = useCallback(async patch => {
@@ -759,6 +775,8 @@ window.__ModuleLoader__.load({
           : { tone: '', title: t('bytes.unavailable'), hint: t('mode.hint') }
 
       const minutes = (history?.minutes ?? []).slice(-240)
+      // 服务端已按新的排前面；最多摆 7 天，多的留在 history.json 里
+      const days = (history?.days ?? []).slice(0, 7)
 
       return h(Fragment, null,
         h('div', { className: 'tm_head' },
@@ -833,6 +851,21 @@ window.__ModuleLoader__.load({
             minutes.length === 0
               ? h('div', { className: 'tm_empty' }, t('chart.empty'))
               : h(Fragment, null, h(Chart, { rows: minutes, t }), h('div', { className: 'tm_label' }, t('chart.hint'))),
+
+            h('div', { className: 'tm_h3', style: { marginTop: 14 } }, t('day.title')),
+            days.length === 0
+              ? h('div', { className: 'tm_empty' }, t('day.empty'))
+              : h(Fragment, null,
+                h('table', { className: 'tm_table' },
+                  h('thead', null, h('tr', null,
+                    h('th', null, t('day.date')),
+                    h('th', { className: 'tm_num' }, t('day.down')),
+                    h('th', { className: 'tm_num' }, t('day.up')))),
+                  h('tbody', null, days.map(row => h('tr', { key: row.day },
+                    h('td', null, row.day),
+                    h('td', { className: 'tm_num' }, fmtBytes(row.rx)),
+                    h('td', { className: 'tm_num' }, fmtBytes(row.tx)))))),
+                h('div', { className: 'tm_label' }, t('day.hint'))),
 
             meta?.dataDir ? h('div', { className: 'tm_label', style: { marginTop: 10, wordBreak: 'break-all' } }, fill(t('settings.dataDir'), { dir: meta.dataDir })) : null,
             summary.adaptersError ? h('div', { className: 'tm_label' }, fill(t('nic.source'), { src: summary.adaptersError })) : null)))

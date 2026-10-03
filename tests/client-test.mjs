@@ -198,4 +198,16 @@ ok('读不到存档就用默认（宽度留空走 CSS 默认）', readFloatState
   JSON.stringify(readFloatState()))
 ok('缩放文案中英齐全', ['float.shrink', 'float.grow', 'float.resize'].every(key => DICT.zh[key] && DICT.en[key]))
 
+// ── 每天重置的口径文案 ─────────────────────────────────────────────────────
+ok('统计窗口文案改成「今日」',
+  DICT.zh['float.share'] === '今日累计' && DICT.zh['tbl.totalDown'] === '今日下行' && DICT.zh['stat.totalDown'] === '今日下行',
+  `${DICT.zh['float.share']}/${DICT.zh['tbl.totalDown']}/${DICT.zh['stat.totalDown']}`)
+ok('英文侧同步改成 Today', DICT.en['float.share'] === 'Today' && DICT.en['tbl.totalDown'] === 'Today down',
+  `${DICT.en['float.share']}/${DICT.en['tbl.totalDown']}`)
+ok('口径说明里写清 00:00 归零', /00:00/.test(DICT.zh['note.tcp']) && /00:00/.test(DICT.en['note.tcp']))
+ok('按天归档有中英文案', ['day.title', 'day.hint', 'day.date', 'day.down', 'day.up', 'day.empty']
+  .every(key => DICT.zh[key] && DICT.en[key]))
+ok('设置页渲染了按天归档表', /day\.title/.test(sourceText) && /fmtBytes\(row\.rx\)/.test(sourceText))
+ok('历史每 30 秒自刷新，跨零点后页面自己换表', /loadHistory\(\)\s*\},\s*30_000\)/.test(sourceText))
+
 console.log(`\nclient-test: ${passed} passed${process.exitCode ? '，有失败' : ''}`)
